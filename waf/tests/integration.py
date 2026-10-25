@@ -20,6 +20,8 @@ import time
 import urllib.parse
 import uuid
 
+FRAMEWORK_MODULE = None
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import policy
 import nginx_edit
@@ -58,9 +60,15 @@ class Backend(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
             return
-        status = int(self.path.rsplit('/', 1)[-1]) if self.path.startswith('/status/') else 200
-        data = json.dumps({'method': self.command, 'bytes': len(body), 'client': self.headers.get('X-Real-IP'),
-                           'forwarded': self.headers.get('X-Forwarded-For'),'forwardedAll':self.headers.get_all('X-Forwarded-For'),'host':self.headers.get('Host'),'proto':self.headers.get('X-Forwarded-Proto'),'authorization':self.headers.get('Authorization')}).encode()
+        status = int(self.path.rsplit('/', 1)[-1]) if self.path.startswith('/status/') else int(self.headers.get('X-Fixture-Status','200'))
+        framework=None
+        if FRAMEWORK_MODULE and self.path.startswith('/framework/'):
+            header=self.path.rsplit('/',1)[-1]
+            value=json.dumps(dict(method=self.command,path=self.path,header=header,headers={k.lower():v for k,v in self.headers.items()}))
+            framework=json.loads(subprocess.check_output(['node',str(Path(__file__).with_name('method-framework-probe.cjs')),str(FRAMEWORK_MODULE),value],timeout=5))
+        data = json.dumps({'method': self.command, 'frameworkMethod':framework, 'bytes': len(body), 'client': self.headers.get('X-Real-IP'),
+                           'forwarded': self.headers.get('X-Forwarded-For'),'forwardedAll':self.headers.get_all('X-Forwarded-For'),'host':self.headers.get('Host'),'proto':self.headers.get('X-Forwarded-Proto'),'authorization':self.headers.get('Authorization'),
+                           'methodOverride':self.headers.get('X-HTTP-Method-Override') or self.headers.get('X-HTTP-Method') or self.headers.get('X-Method-Override')}).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
@@ -83,11 +91,14 @@ def run(*args, **kw):
 
 
 def main():
+    global FRAMEWORK_MODULE
     parser = argparse.ArgumentParser()
     parser.add_argument('--image', required=True)
     parser.add_argument('--modsec-dir', type=Path)
     parser.add_argument('--work-dir', type=Path, required=True)
+    parser.add_argument('--framework-module',type=Path,help='Verified method-override@3.0.0 index.js; optional real middleware checks')
     args = parser.parse_args()
+    FRAMEWORK_MODULE=args.framework_module
     if args.work_dir.exists():
         raise ValueError('Use a new work directory for immutable evidence')
     work = args.work_dir.absolute()
@@ -102,6 +113,8 @@ def main():
                   sites={'wordpress.example': {'profile': 'wordpress'}, 'off.example': {'mode': 'off'},
                          'detect.example': {'mode': 'detect'}, 'stream.example': {'profile': 'streaming'},
                          'upload.example': {'profile': 'upload'}, 'api.example': {'profile': 'api'},'artifact.example':{'profile':'artifact-proxy'},
+                         'strict.example':{'methodOverride':'strict'},
+                         'unicode.example':{'exclusions':[{'ruleId':932260,'path':'/category/docker-项目/','target':'REQUEST_FILENAME'}]},
                          'proxy.example': {'cdn':'proxy','trustedProxies':['127.0.0.1/32','127.0.0.2/32']}})
     cf = policy.networks(json.loads((bundle / 'cloudflare-ips.json').read_text()))
     generated = work / 'conf.d/waf'
@@ -132,12 +145,12 @@ proxy_pass http://fixture_backend;
 '''
     blocks = []
     for host in ['one.example', 'two.example', 'wordpress.example', 'off.example', 'detect.example',
-                 'stream.example', 'upload.example', 'api.example', 'rate.example','artifact.example']:
+                 'stream.example', 'upload.example', 'api.example', 'rate.example','artifact.example','strict.example','narrow.example','underscore.example','unicode.example']:
         blocks.append('server { listen unix:/test/front.sock; server_name ' + host + ';\n'
                       'set_real_ip_from unix:; real_ip_header CF-Connecting-IP;\n'
                       'include /etc/nginx/conf.d/waf/server-default.inc;\n'
-                      'client_max_body_size 64m;\n'
-                      'location / {\n' + ('limit_req zone=fixture_rate burst=2 nodelay;\n' if host == 'rate.example' else '')
+                      'client_max_body_size 64m;\n'+('underscores_in_headers on;\n' if host=='underscore.example' else '')
+                      + 'location / {\n' + ('limit_req zone=fixture_rate burst=2 nodelay;\n' if host == 'rate.example' else '')
                       + proxy + '\n}\n}\n')
     blocks.append('server { listen 127.0.0.1:18080; server_name direct.example; '
                   'include /etc/nginx/conf.d/waf/server-default.inc; location / { ' + proxy + ' } }')
@@ -150,6 +163,10 @@ proxy_pass http://fixture_backend;
     blocks.append(nginx_edit.patch_application(parent,nginx_edit.configuration_headers(dump),'/etc/nginx/conf.d/parent.conf'))
     duplicate='server { listen unix:/test/front.sock; server_name duplicate.example; set_real_ip_from unix:; real_ip_header CF-Connecting-IP; include /etc/nginx/conf.d/waf/server-default.inc; location / { proxy_set_header x-forwarded-for $http_x_forwarded_for; proxy_set_header X-Forwarded-For bad; proxy_pass http://fixture_backend; } }'
     blocks.append(nginx_edit.patch_application(duplicate))
+    blocks.append('server { listen unix:/test/front.sock; server_name acl.example; include /etc/nginx/conf.d/waf/server-default.inc; location / { limit_except POST { deny all; } '+proxy+' } }')
+    blocks.append('server { listen unix:/test/front.sock; server_name quiet.example; include /etc/nginx/conf.d/waf/server-default.inc; location = /api/log { error_log /var/log/nginx/error.log crit; access_log /var/log/nginx/waf-protocol.log waf_protocol; '+proxy+' } }')
+    blocks.append('server { listen unix:/test/front.sock; server_name realm.example; include /etc/nginx/conf.d/waf/server-default.inc; auth_basic $fixture_realm; auth_basic_user_file /test/empty.htpasswd; location / { '+proxy+' } }')
+    (work/'empty.htpasswd').write_text('')
     child='server { listen unix:/test/front.sock; server_name child.example; modsecurity on; set_real_ip_from unix:; real_ip_header CF-Connecting-IP; location / { modsecurity on; '+proxy+' } location /custom-off { modsecurity off; '+proxy+' } }'
     migrated=nginx_edit.patch_site(child,config)
     assert 'modsecurity on;' not in migrated and 'modsecurity off;' in migrated
@@ -163,7 +180,9 @@ http {
 include /etc/nginx/mime.types;
 modsecurity on;
 include /etc/nginx/conf.d/waf/http.conf;
+access_log /var/log/nginx/access.log combined;
 map $http_upgrade $fixture_connection { default upgrade; '' close; }
+map $request_method $fixture_realm { default off; DELETE admin; }
 limit_req_zone $remote_addr zone=fixture_rate:1m rate=1r/s;
 upstream fixture_backend { server unix:/test/backend.sock; }
 ''' + main_headers+'\n'+'\n'.join(blocks) + '\n}\n'
@@ -215,6 +234,62 @@ upstream fixture_backend { server unix:/test/backend.sock; }
                 raise RuntimeError(run('docker', 'logs', name).stdout.decode())
             time.sleep(0.1)
         run('docker', 'exec', name, 'nginx', '-t')
+        # Only a complete effective gateway graph can activate guarded semantics.
+        controls=nginx_edit.method_override_controls(run('docker','exec',name,'nginx','-T').stdout.decode())
+        assert controls==(False,{'acl.example','realm.example','underscore.example'}),controls
+        (generated/'profile-rules.conf').write_text(policy.render_profile_rules(config,controls))
+        guard=(generated/'method-override.conf').read_text()
+        (generated/'method-override.conf').write_text('SecRule UNIQUE_ID "@beginsWith narrow.example|" "id:1160,phase:1,pass,nolog,t:none,setvar:\'tx.allowed_methods=GET HEAD POST PATCHING UNDELETE OUTPUT\'"\n'+guard)
+        old_workers={line.split()[0] for line in run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines() if 'nginx: worker process' in line}
+        run('docker','exec',name,'nginx','-s','reload')
+        for attempt in range(100):
+            new_workers={line.split()[0] for line in run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines() if 'nginx: worker process' in line}
+            if new_workers and not old_workers & new_workers:break
+            time.sleep(.1)
+        else:raise RuntimeError('Guarded fixture worker did not become ready')
+        for host in ['one.example','two.example','api.example']:
+            for header in ['X-HTTP-Method-Override','X-HTTP-Method','X-Method-Override']:
+                for method in ['PUT','PATCH','DELETE']:
+                    _,data=check('guarded-method-'+host+'-'+header+'-'+method,host=host,path='/different-resource',method='POST',
+                                 body=b'{"name":"normal"}',headers={'Content-Type':'application/vnd.api+json',header:method})
+                    assert json.loads(data)['method']=='POST' and json.loads(data)['methodOverride']==method
+        for host in ['strict.example','acl.example','realm.example','underscore.example']:
+            check('gateway-or-operator-strict-'+host,host=host,method='POST',headers={'X-HTTP-Method-Override':'DELETE'},expected=403)
+        if FRAMEWORK_MODULE:
+            for header in ['X-HTTP-Method-Override','X-HTTP-Method','X-Method-Override']:
+                for method in ['PUT','PATCH','DELETE']:
+                    _,data=check('actual-framework-'+header+'-'+method,host='api.example',path='/framework/'+header,
+                                 method='POST',body=b'{"title":"normal"}',headers={header:method,'Content-Type':'application/json'})
+                    assert json.loads(data)['frameworkMethod']==dict(original='POST',effective=method)
+        for method in ['PUT','PATCH','DELETE']:
+            check('allowed-method-requires-complete-token-'+method,host='narrow.example',method='POST',headers={'X-HTTP-Method-Override':method},expected=403)
+        check('method-acl-original-post',host='acl.example',method='POST')
+        check('method-acl-original-delete',host='acl.example',method='DELETE',expected=403)
+        check('method-realm-original-post',host='realm.example',method='POST')
+        check('method-realm-original-delete',host='realm.example',method='DELETE',expected=401)
+        for value in ['TRACE','CONNECT','GET','OPTIONS','patch','PATCH,DELETE','PATCH DELETE','PATCH;DELETE']:
+            check('invalid-override-'+value,method='POST',headers={'X-HTTP-Method-Override':value},expected=403)
+        check('non-post-method-override',headers={'X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('conflicting-method-headers',method='POST',headers={'X-HTTP-Method-Override':'PATCH','X-Method-Override':'DELETE'},expected=403)
+        check('duplicate-method-header',method='POST',headers={'X-HTTP-Method-Override':'PATCH','x-http-method-override':'PATCH'},expected=403)
+        for headers in [{'X_HTTP_METHOD_OVERRIDE':'PATCH'}, {'X-HTTP-Method-Override':'PATCH','X_HTTP_METHOD_OVERRIDE':'DELETE'}]:
+            check('underscore-collision-remains-denied',host='underscore.example',method='POST',headers=headers,expected=403)
+        for body,content_type in [(b'_method=DELETE','application/x-www-form-urlencoded'),
+                                  (b'{"_method":"DELETE"}','application/json'),
+                                  (b'{"_method":["DELETE"]}','application/json')]:
+            check('mixed-override-'+content_type+'-'+body.decode(),method='POST',body=body,
+                  headers={'Content-Type':content_type,'X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('query-header-override-conflict',path='/?_method=DELETE',method='POST',headers={'X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('header-override-keeps-body-SQLi',method='POST',body=json.dumps({'q':"1' UNION SELECT password FROM users--"}).encode(),
+              headers={'Content-Type':'application/json','X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('header-override-keeps-body-XSS',method='POST',body=b'{"q":"<script>alert(1)</script>"}',
+              headers={'Content-Type':'application/json','X-HTTP-Method-Override':'PUT'},expected=403)
+        check('other-restricted-header-still-denied',method='POST',headers={'X-HTTP-Method-Override':'PATCH','Proxy':'http://example.test'},expected=403)
+        check('guard-invalid',path='/guard-invalid',method='POST',headers={'X-HTTP-Method-Override':'TRACE'},expected=403)
+        check('guard-mixed',path='/guard-mixed',method='POST',body=b'_method=DELETE',headers={'Content-Type':'application/x-www-form-urlencoded','X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('guard-detection',host='detect.example',path='/guard-detection',method='POST',headers={'X-HTTP-Method-Override':'TRACE'})
+        check('guard-off',host='off.example',method='POST',headers={'X-HTTP-Method-Override':'TRACE'})
+        check('method-body-parameter-existing-PL1-behavior',method='POST',body=b'_method=PATCH&title=normal',headers={'Content-Type':'application/x-www-form-urlencoded'})
         for method in ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH', 'DELETE']:
             check('REST-' + method, host='api.example', method=method)
         _,data=check('migrated-http-parent-business-headers',host='parent.example')
@@ -231,6 +306,11 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('artifact-query-file-traversal-still-denied',host='artifact.example',path='/?file=../../etc/passwd',expected=403)
         check('schemeless-exclusion-never-applies-to-other-sites',path='/raw.githubusercontent.com/org/repo/main/test.sh',expected=403)
         check('JSON', host='api.example', method='POST', body=b'{"name":"hello","count":2}', headers={'Content-Type': 'application/json'})
+        check('unicode-filename-exclusion',host='unicode.example',path=urllib.parse.quote('/category/docker-项目/'))
+        check('unicode-filename-exclusion-keeps-query-protection',host='unicode.example',
+              path=urllib.parse.quote('/category/docker-项目/')+'?q='+urllib.parse.quote("1' UNION SELECT password FROM users--"),expected=403)
+        check('unicode-filename-exclusion-is-read-only',host='unicode.example',path=urllib.parse.quote('/category/docker-项目/'),
+              method='POST',body=b'{"text":"valid"}',headers={'Content-Type':'application/json'},expected=403)
         check('vendor-JSON', host='api.example', method='PATCH', body=b'{"name":"hello"}', headers={'Content-Type': 'application/vnd.api+json'})
         check('XML',host='api.example',method='POST',body=b'<root>hello</root>',headers={'Content-Type':'application/xml'})
         check('malformed-XML',host='api.example',method='POST',body=b'<root>',headers={'Content-Type':'application/xml'},expected=(400,403))
@@ -259,7 +339,7 @@ upstream fixture_backend { server unix:/test/backend.sock; }
               headers={'Content-Type':'application/json','User-Agent':'sqlmap/1.8'})
         # The response may finish before phase-5 serial audit logging. Wait for
         # these exact complete transactions, rather than racing the worker.
-        wanted = {'/early-header', '/detect-early-header'}
+        wanted = {'/early-header', '/detect-early-header','/guard-invalid','/guard-mixed','/guard-detection'}
         deadline = time.monotonic() + 2
         while True:
             transactions = []
@@ -277,12 +357,55 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         detect_ids = {message['details']['ruleId'] for message in detect['messages']}
         assert '949111' in early_ids and not any(rule.startswith('942') for rule in early_ids), early_ids
         assert '913100' in detect_ids and '942100' in detect_ids, detect_ids
+        for path,expected_ids,engine,status in [('/guard-invalid',{'1122','949110'},'Enabled',403),
+                                                ('/guard-mixed',{'1123','949110'},'Enabled',403),
+                                                ('/guard-detection',{'1122','949110'},'DetectionOnly',200)]:
+            item=next(t for t in transactions if t['request']['uri']==path)
+            ids={m['details']['ruleId'] for m in item['messages']}
+            assert expected_ids<=ids,(path,ids)
+            assert item['producer']['secrules_engine']==engine,(path,item['producer'])
+            assert item['response']['http_code']==status
         check('off-mode', host='off.example', path=sqli)
         check('absolute-form-cannot-select-off-policy', host='off.example', path='http://one.example' + sqli, expected=403)
         check('WordPress-password', host='wordpress.example', path='/wp-login.php', method='POST',
               body=urllib.parse.urlencode({'log': 'user', 'pwd': "1' UNION SELECT password FROM users--"}),
               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        check('override-does-not-inherit-WordPress-password-exclusion',host='wordpress.example',path='/wp-login.php',method='POST',
+              body=urllib.parse.urlencode({'log':'user','pwd':"1' UNION SELECT password FROM users--"}),
+              headers={'Content-Type':'application/x-www-form-urlencoded','X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('override-does-not-inherit-git-protocol-exclusion',host='artifact.example',path='/https://github.com/org/repo.git/git-upload-pack',method='POST',
+              body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','X-HTTP-Method-Override':'PATCH'},expected=403)
         check('malformed-JSON', host='api.example', method='POST', body=b'{broken', headers={'Content-Type': 'application/json'}, expected=(400, 403))
+        marker='/parser-noise-observation'
+        check('malformed-JSON-keeps-denial-with-compact-access-record',host='api.example',path=marker,
+              method='POST',body=b'{"action":"raw\x1bcontrol"}',headers={'Content-Type':'application/json'},expected=400)
+        deadline=time.monotonic()+2
+        while marker not in (work/'logs/access.log').read_text():
+            if time.monotonic()>=deadline:raise AssertionError('Missing ordinary access record for rejected JSON')
+            time.sleep(.025)
+        # Connector 1.0.4 always emits an intervention error even with nolog.
+        assert marker in (work/'logs/error.log').read_text()
+        assert marker not in (work/'logs/waf-audit.json').read_text()
+        results.append({'test':'malformed-JSON-no-duplicate-audit','passed':True})
+        check('quiet-endpoint-still-rejects-malformed-JSON',host='quiet.example',path='/api/log',method='POST',
+              body=b'{"action":"raw\x1bcontrol"}',headers={'Content-Type':'application/json'},expected=400)
+        check('quiet-endpoint-retains-upstream-failure-status',host='quiet.example',path='/api/log',method='POST',
+              body=b'{"action":"valid"}',headers={'Content-Type':'application/json','X-Fixture-Status':'503'},expected=503)
+        check('quiet-endpoint-keeps-attack-audit',host='quiet.example',path='/api/log',method='POST',
+              body=b'{"action":"valid"}',headers={'Content-Type':'application/json','User-Agent':'sqlmap/1.8'},expected=403)
+        deadline=time.monotonic()+2
+        while True:
+            records=[json.loads(line) for line in (work/'logs/waf-protocol.log').read_text().splitlines()]
+            audits=[json.loads(line)['transaction'] for line in (work/'logs/waf-audit.json').read_text().splitlines()]
+            quiet=[item for item in audits if item['unique_id'].startswith('quiet.example|')]
+            if len(records)>=3 and quiet:break
+            if time.monotonic()>=deadline:raise AssertionError('Quiet endpoint logging did not finish')
+            time.sleep(.025)
+        assert {item['status'] for item in records}=={400,403,503}
+        assert any(item['upstream']=='503' for item in records)
+        assert all(item['response']['http_code']==403 for item in quiet)
+        assert 'quiet.example' not in (work/'logs/error.log').read_text()
+        results.append({'test':'quiet-endpoint-complete-access-and-security-audit','passed':True})
         check('deep-JSON', host='api.example', method='POST', body=('[' * 70 + '0' + ']' * 70).encode(), headers={'Content-Type': 'application/json'}, expected=(400, 403))
         check('large-valid-JSON', host='api.example', method='POST', body=json.dumps({'text': 'a' * (1024*1024)}).encode(), headers={'Content-Type': 'application/json'})
         boundary = 'fixtureBoundary'

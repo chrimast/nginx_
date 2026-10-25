@@ -42,6 +42,26 @@ python3 -B configure.py status
 
 `--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和密码/代码参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
 
+站点 `exclusions` 支持 Unicode 字面路径，例如 `{"ruleId":932260,"path":"/category/docker-项目/","target":"REQUEST_FILENAME"}`。路径填写解码后的文字，不接受百分号编码、通配符或正则表达式。`REQUEST_FILENAME` 例外只适用于 GET/HEAD 且无方法覆盖头的精确路径；仅移除指定规则的路径目标，查询、正文和其他规则保持检查。既有 `ARGS:参数名` 例外行为不变。部署域名及具体业务路径留在用户策略内，不进入公共默认值。这遵循 [CRS 精确排除建议](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)；CRS 4.30 加入路径命令注入检查后，[官方要求关注路径误报](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)，不能为兼容而整体关闭 RCE 路径检测。
+
+## 通用请求语义兼容
+
+共享修复 `eb58fe4` 将方法覆盖按协议行为统一处理，不绑定 Flarum、域名或 `/api` 路径。仅原始 POST、单个 `X-HTTP-Method-Override` / `X-HTTP-Method` / `X-Method-Override` 头、明确的 PUT/PATCH/DELETE 且完整匹配既有允许方法时，才可进入兼容处理。请求方法及正文不改写，SQLi/XSS 等攻击检查继续执行；重复、冲突、危险值、覆盖头与顶层 query/body `_method` 混用仍由协议守卫按原评分基线拦截。参数 `_method` 单独使用仍遵循原有 PL1/PL2 行为，此开关不替代框架授权或 CSRF 防护。
+
+默认策略为 `methodOverride: guarded`，但只有管理工具核对完整 `nginx -T` 能力图后才激活。遇到 `limit_except`、按原始方法派生的权限条件、认证子请求、脚本认证或方法头改写等不确定语义时，对相应作用域保持 strict。覆盖请求不继承 WordPress、KPanel、Git 及自定义参数的业务排除，避免把原 POST 的特例错误用于另一种方法。也可明确设置全局或站点 `methodOverride: strict`；原有 WAF Off/Detect/On 和 CDN 模式独立保留。
+
+```sh
+python3 -B configure.py configure --method-override guarded
+python3 -B configure.py configure --site example.com --method-override strict
+python3 -B configure.py doctor
+```
+
+`status` 的 `methodOverride.synchronized` 核对当前能力与实际受管规则是否一致；`doctor` 在漂移时失败。手工调整 ACL、认证或代理头后，先 `apply` / 原生刷新再重载并检查；已有原生受管重载入口会刷新配置。普通 `nginx -s reload` 本身不会重新生成管理策略。仅更新镜像且未刷新受管配置的旧链路保持严格行为，不宣称自动获得这一兼容功能。本轮不更改版本号或重建镜像，配置包按提交及摘要分发。
+
+该实现保留 CRS 完整 `rules/*.conf` 装载，仅从 920450 的头名目标中排除三个规范名字，由自有 phase 2 守卫承担其严格校验并保留 949 评分/审计事件；其他受限头仍由原规则处理。ModSecurity 3.0.17 的动态单目标控制存在大小写边界，因此采用经真实引擎验证的配置期正则目标。隔离验证通过 Linux 70 项单测与 147 项真实 Nginx/ModSecurity 集成，含 Express `method-override@3.0.0` 组件 9 项有效方法检查、SQLi/XSS、ACL、多站点、可信代理、业务排除、Off/Detect、日志和恢复。其他框架为行为分析及请求形状覆盖，未宣称都做过完整登录业务测试。
+
+依据：[CRS 4.30 协议规则](https://raw.githubusercontent.com/coreruleset/coreruleset/v4.30.0/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf)、[ModSecurity 目标更新](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-(v3.x)#secruleupdatetargetbyid)、[Express 方法覆盖组件](https://github.com/expressjs/method-override)、[Nginx 方法权限](https://nginx.org/en/docs/http/ngx_http_core_module.html#limit_except)。
+
 ## 来源地址与 CDN
 
 ```sh
@@ -59,9 +79,11 @@ python3 -B configure.py refresh-ips
 
 `existing-filters` 仅更新带有共享方案管理标记的既有 Fail2Ban 过滤器，不创建 jail 或动作。`retire-jails` 是显式迁移动作：只停用旧脚本按普通业务状态计数的九个网站 jail，保留 SSH 和自定义 jail；执行前应确认替代的受信事件链路已可用。不要把该动作当作新用户完整安装流程。公共旧网站 jail 模板默认关闭，不自动改变已安装的 jail；原生重装或重新配置 CF/Fail2Ban 会重新下载模板，须回读传统 jail 的启用状态，不能把配置成功等同于累计封禁已经生效。
 
-审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。
+审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。请求体解析失败仍在 WAF 返回 400，由访问日志保留请求与状态，`nolog` 减少重复审计，其他攻击规则继续审计。当前 1.0.4 连接器仍强制写入拦截错误，不能将 `nolog` 宣称为完全抑制错误日志，见[连接器源码](https://github.com/owasp-modsecurity/ModSecurity-nginx/blob/v1.0.4/src/ngx_http_modsecurity_module.c)。
 
-安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 -B configure.py rotation`。它保留其他 cron 项，按分钟检查两个 WAF 日志，单文件超过 10 MiB 或到每日轮转时切分，保留四份并压缩。高流量下一分钟内仍可能超过 10 MiB；`copytruncate` 有标准的短暂日志丢失窗口，不用于声称无损取证。
+高频上报等单一业务可在管理员确认后，针对精确 `location` 使用 `error_log /var/log/nginx/error.log crit` 和 `access_log /var/log/nginx/waf-protocol.log waf_protocol`，同时保留现有 WAF 限流访问日志。该可选策略保留每次请求的状态、上游状态、耗时及请求编号，减少重复的拦截错误；正文校验、400 拒绝和 403 攻击审计保持开启。它也会减少该位置其他非致命错误细节，因此不能自动推广到所有业务位置。共享轮转同时覆盖 `waf-protocol.log`。
+
+安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 -B configure.py rotation`。它按分钟检查 WAF 专用日志和普通访问、错误日志，分别以 10 MiB、50 MiB 为轮转阈值，各保留四份；普通日志立即压缩，WAF 专用日志沿用延迟压缩。只移除包内已知的旧容器轮转任务，保留其他 cron 项。阈值不是硬磁盘配额，高流量下一分钟内仍可超出；`copytruncate` 保留在用文件描述符，但有标准的短暂日志丢失窗口，不用于声称无损取证，见 [logrotate 官方手册](https://github.com/logrotate/logrotate/blob/main/logrotate.8.in)。
 
 配置应用先校验完整 include/代理头继承图，保存精确原件，再检查候选语法、重载并观察新的工作进程；失败恢复原件。重复应用不增加相同配置备份。受管备份上限 128 份、64 MiB，达到限额会要求管理员归档，不静默删除恢复点。
 
@@ -132,6 +154,14 @@ python3 waf/tests/performance.py --image <已核验的本地镜像> \
 测试容器无公网端口、无外网，CPU 绑定且内存禁用额外 swap。覆盖 Unix HTTP/1.1、回环 TLS HTTP/2、可信代理身份模拟、直连、64 个并发 SSE、多站点及共享出口；身份模拟不是真实 CDN 压测。Off 闭环部分受发压器限制，少量长连接的闭环也不代表整机极限；小样本的 P99 不作为稳定尾延迟承诺。
 
 每轮保留镜像、源文件和工具摘要、原始响应计数、有效吞吐、调度延迟、CPU、内存及日志数据。日志按 250 ms 检查预算，默认阈值 128 MiB；超限停止本任务发压容器，保留证据。`--suite guard --variants off --log-budget-mib 1` 用于验证此失败路径，预期非零退出。源码策略与工具验证不替代新镜像的正式双架构构建和公开产物核验。
+
+## 2026-10-25 配置与遥测维护发布
+
+共享配置代码固定为 [`1662016`](https://github.com/kejilion/nginx/commit/16620161a319443747ac0fc89242cbf510e89716)，原生脚本固定为 [`5edce6d`](https://github.com/kejilion/sh/commit/5edce6da87fef5f203efcc9dee98dc244eabf0c2)。本轮发布配置包和脚本维护修复，不重建或替换 WAF 镜像；旧客户端需要更新脚本后才能获得 JSON 转义、网络超时及单进程发送频率限制。
+
+精确候选通过 74 项 Linux 单测、147 项真实 Nginx/ModSecurity 隔离检查、5 项遥测编码与预算测试、10 项固定包引导测试、47 项配置更新/失败恢复测试及 3 项备份测试。源站约 12 分钟观察中正常上报成功、旧格式请求仍返回 400，错误及审计日志增长约下降 99%；这是本轮观察事实，不代表所有部署的长期性能。中文文件名例外保持精确站点、路径、CRS 规则和 GET/HEAD 范围，其他参数攻击仍受检查。高频接口的专用日志等级属于部署配置，不进入所有站点的公共默认值。
+
+固定包六个文件按公开提交地址逐项校验 SHA256；回退代码基线分别为共享仓库 `3c69706`、脚本仓库 `805c5f0`。公开回退应形成聚焦的恢复提交，保留固定源码身份及管理员定制。已安装 KPanel 镜像内的固定脚本仍按 KPanel 发行流程更新，本次原生脚本发布不代表面板发行或升级已完成。
 
 ## 验证与依据
 

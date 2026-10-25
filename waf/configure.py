@@ -202,13 +202,23 @@ def _rotation(root,config):
     copytruncate
     create 0640 root root
 }
+'''+str(root/'log/nginx/error.log')+' '+str(root/'log/nginx/access.log')+' '+str(root/'log/nginx/waf-protocol.log')+''' {
+    daily
+    maxsize 50M
+    rotate 4
+    missingok
+    notifempty
+    compress
+    copytruncate
+}
 ''').encode()
     crontab=subprocess.run(['crontab','-l'],capture_output=True,text=True,timeout=10)
     if crontab.returncode and 'no crontab' not in crontab.stderr.lower():raise ValueError('Unable to preserve existing crontab')
     before=crontab.stdout if crontab.returncode==0 else ''
     marker='# kejilion-waf-logrotate'
     job='* * * * * '+binary+' --state '+str(directory/'logrotate.status')+' '+str(path)+' >/dev/null 2>&1 '+marker
-    lines=[line for line in before.splitlines() if not line.endswith(marker)]
+    legacy='0 2 * * * docker exec nginx apk add logrotate && docker exec nginx logrotate -f /etc/logrotate.conf'
+    lines=[line for line in before.splitlines() if not line.endswith(marker) and line!=legacy]
     updated='\n'.join([*lines,job])+'\n'
     backup=directory/'logrotate-cron-preimage.txt'
     if not backup.exists():atomic(backup,before.encode())
@@ -329,7 +339,9 @@ def make_plan(root, config, cfdata=None):
     changes = {}
     main = root / 'nginx.conf'
     allowed_proxy_files={'/etc/nginx/conf.d/'+p.name for p in (root/'conf.d').glob('*.conf')}
-    header_scopes=nginx_edit.configuration_headers(execute('docker','exec',config['container'],'nginx','-T'),allowed_proxy_files)
+    effective=execute('docker','exec',config['container'],'nginx','-T')
+    header_scopes=nginx_edit.configuration_headers(effective,allowed_proxy_files)
+    method_controls=nginx_edit.method_override_controls(effective)
     if any(name not in allowed_proxy_files and not name.startswith('/etc/nginx/conf.d/waf/') for name,_ in header_scopes):
         raise ValueError('Proxy directives outside managed site files need explicit integration')
     main_text=read_config(main)
@@ -377,7 +389,7 @@ def make_plan(root, config, cfdata=None):
         raise ValueError('Site count exceeds supported budget')
     policy.validate(config)
     directory = root / 'conf.d/waf'
-    for name, content in policy.bundle_files(config, cloudflare).items():
+    for name, content in policy.bundle_files(config, cloudflare,method_controls).items():
         changes[directory / name] = content.encode()
     changes[directory / 'cloudflare-ips.json'] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
     changes[current] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
@@ -539,10 +551,17 @@ def configured_status(root,config):
         raise ValueError('Child WAF switch conflicts with the global Off state; apply migration first')
     # Verify the expanded source graph before claiming a global mode. External
     # HTTP fragments can otherwise override the main file's apparent Off state.
-    nginx_edit.configuration_headers(execute('docker','exec',config.get('container','nginx'),'nginx','-T'),{'/etc/nginx/conf.d/'+path.name for path in files})
+    effective=execute('docker','exec',config.get('container','nginx'),'nginx','-T')
+    nginx_edit.configuration_headers(effective,{'/etc/nginx/conf.d/'+path.name for path in files})
+    strict_all,strict_sites=nginx_edit.method_override_controls(effective)
+    profile=root/'conf.d/waf/profile-rules.conf'
+    synchronized=profile.exists() and read_config(profile)==policy.render_profile_rules(config,(strict_all,strict_sites))
     mode='off' if not engine else ('on' if not policy.engine_enabled(config) else (next(iter(modes)) if len(modes)==1 else 'mixed'))
     return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
-            'banBackend':config.get('banBackend','existing'),'source':'configuration'}
+            'banBackend':config.get('banBackend','existing'),'source':'configuration',
+            'methodOverride':{'configured':config.get('methodOverride','guarded'),
+                              'gatewayStrictAll':strict_all,'gatewayStrictSites':sorted(strict_sites),
+                              'synchronized':synchronized}}
 
 
 def main():
@@ -555,9 +574,10 @@ def main():
     parser.add_argument('--cdn',choices=['direct','cloudflare','mixed','proxy'])
     parser.add_argument('--site')
     parser.add_argument('--profile',choices=sorted(policy.PROFILES))
+    parser.add_argument('--method-override',choices=['guarded','strict'])
     args=parser.parse_args()
     if args.profile and not args.site:parser.error('--profile requires --site')
-    if args.action!='configure' and any([args.mode,args.site,args.profile,args.cdn]):parser.error('Policy options require configure')
+    if args.action!='configure' and any([args.mode,args.site,args.profile,args.cdn,args.method_override]):parser.error('Policy options require configure')
     if os.geteuid()!=0:parser.error('Root privileges required')
     root=args.root.absolute()
     safe_parent(root/'config/waf/policy.json')
@@ -580,11 +600,13 @@ def main():
                 if args.mode:site['mode']=args.mode
                 if args.profile:site['profile']=args.profile
                 if args.cdn:site['cdn']=args.cdn
+                if args.method_override:site['methodOverride']=args.method_override
             else:
                 if args.mode:
                     config['mode']=args.mode
                     for item in config['sites'].values():item.pop('mode',None)
                 if args.cdn:config['cdn']=args.cdn
+                if args.method_override:config['methodOverride']=args.method_override
             config['logTimezone']='UTC'+execute('docker','exec',config['container'],'date','+%z').strip()
         if args.action=='trust-cloudflare':result=trust_cloudflare(root,config,expected)
         elif args.action=='retire-jails':result=fail2ban_update(root,legacy=True)
@@ -605,6 +627,8 @@ def main():
         else:
             if args.action=='doctor':execute('docker','exec',config['container'],'nginx','-t')
             result=configured_status(root,config)
+            if args.action=='doctor' and not result['methodOverride']['synchronized']:
+                raise ValueError('Gateway capabilities or managed policy changed; apply/refresh the shared WAF configuration before enabling method override compatibility')
             result['syntax']='passed' if args.action=='doctor' else 'not-checked'
     print(json.dumps(result,sort_keys=True))
 
