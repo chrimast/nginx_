@@ -31,6 +31,7 @@ python3 -B configure.py configure --site example.com --profile wordpress --mode 
 python3 -B configure.py configure --site api.example.com --profile api --mode on
 python3 -B configure.py configure --site proxy.example.com --profile artifact-proxy --mode on
 python3 -B configure.py configure --site panel.example.com --profile kpanel --mode on
+python3 -B configure.py configure --site forum.example.com --profile flarum --mode on
 python3 -B configure.py status
 ```
 
@@ -40,7 +41,7 @@ python3 -B configure.py status
 
 兼容镜像只提供容器内部的规则基线与请求解析余量，不改宿主挂载、CF 模式或封禁动作。完整站点策略、受信代理、日志轮转与可回滚升级由同源固定版本配置包接入；不应把单独更新镜像解释为已完成所有宿主配置迁移。旧规则的评分阈值与审计开关由镜像兼容层保留，启用完整配置包后才使用本方案的阈值和审计策略。用户日常仍通过原生 WAF 开关操作。
 
-`--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和密码/代码参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
+`--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件及受限文章路径兼容；`flarum` 仅对 JSON:API 发帖正文和登录密码作精确例外；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和已知业务参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
 
 站点 `exclusions` 支持 Unicode 字面路径，例如 `{"ruleId":932260,"path":"/category/docker-项目/","target":"REQUEST_FILENAME"}`。路径填写解码后的文字，不接受百分号编码、通配符或正则表达式。`REQUEST_FILENAME` 例外只适用于 GET/HEAD 且无方法覆盖头的精确路径；仅移除指定规则的路径目标，查询、正文和其他规则保持检查。既有 `ARGS:参数名` 例外行为不变。部署域名及具体业务路径留在用户策略内，不进入公共默认值。这遵循 [CRS 精确排除建议](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)；CRS 4.30 加入路径命令注入检查后，[官方要求关注路径误报](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)，不能为兼容而整体关闭 RCE 路径检测。
 
@@ -178,3 +179,70 @@ python3 -m unittest discover -s waf/tests -p 'test_*.py'
 生产副本迁移及真实 KPanel 用例位于 `tests/pilot_config.py`、`tests/kpanel_profile.py`。它们使用无外网、无公开端口的隔离容器；KPanel 用例不挂载 Agent，因此文件内容测试只验证请求通过 WAF 到达 Agent 边界，不代表实际写文件功能通过。
 
 持续迭代规范、当前特性状态、后续评估队列和组件官方依据见 [PRINCIPLES.md](PRINCIPLES.md)。限流余量不能代替精确误报排除，WAF 配置通过也不等于 OWASP ASVS 整体符合性。
+
+## 2026-10-26 公共应用兼容发布
+
+本轮修改共享配置包，不修改 KPanel 程序、不重建镜像、不提升版本号。通用反代模板生成的混合大小写 upstream 现可正确匹配 KPanel 容器端点；混合后端、未知业务 include 或脚本转发不能自动获得 KPanel 例外。已有显式 profile 优先。Flarum 自动识别同时要求项目及安装包元数据，遇到其他反代、不同 root、未知 include 或无法证明的 PHP 脚本路径时保持默认配置档。
+
+首次授权生产试点发现打包图标 `/desktop-icons/` 的普通文件名仍触发 `932260`，已在发布前精确回滚。补充配置档内 `assets` / `desktop-icons` 的 GET/HEAD 静态文件语法：限定目录深度、文件名与扩展名，拒绝双点及 shell 字符，仅排除该规则的路径目标；查询、正文及其他规则继续扫描。新增 12 项真实引擎正反例和真实 KPanel WebP 文件内容检查通过，公共矩阵增为 135 项、真实应用检查增为 22 项。该回退与补齐不能省略为“首次试点全部正常”。
+
+同一试点还确认既有反代把未登录图标的 404 缓存了 10 分钟，带入口 Cookie 的后续请求仍命中该结果。KPanel 共享配置档的 server hook 增加 `proxy_cache_bypass $http_authorization $http_cookie` 与 `proxy_no_cache $http_authorization $http_cookie`，同时避免已认证内容进入共享缓存；generic 默认及管理员位置级显式覆盖保持原样。真实缓存的匿名 MISS/HIT、两个 Cookie 独立内容、Authorization BYPASS 及匿名结果保持共 6 项通过，公共矩阵增为 141 项，Linux 单测增为 78 项。此保守选择会减少带 Cookie 的静态请求缓存命中；浏览器缓存与 CDN 策略独立，不声称没有性能代价。依据：[Nginx 缓存读取条件](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_bypass)及[写入条件](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_no_cache)。
+
+缓存谓词按两个指令各自的有效继承图处理：server 已有条件时同层追加认证条件；原无条件时复制有效 HTTP 条件后追加，避免改变原有 `$arg_nocache`、自定义开关或始终绕过策略。只忽略本包已生成的 server hook 以保证重复应用和 HTTP 条件后续变更可重新计算；位置级显式列表仍由管理员决定。补充 HTTP 继承、server 自定义及替代 HTTP、location 自定义及替代 server 的 5 项真实缓存检查通过，最终公共矩阵 146 项、Linux 单测 79 项。初版 server hook 未保留 HTTP 继承的缺陷在隔离复核中发现，未部署该中间版本。
+
+同域多个物理 server 若需要不同的继承列表，KPanel 配置档会明确中止本次应用并保留旧配置，要求管理员先统一条件，避免按文件顺序静默选择；generic 站点不受此应用配置档约束。合法引号写法及管理员自定义 include 的缓存条件也参与识别。
+
+- KPanel：桌面窗口路径、快捷命令/链接、文件路径及操作、Compose/环境变量、终端历史、交互输入和联合通信按明确方法、端点和字段兼容。Base64 终端输入及 Noise 消息仅排除 SQLi 字段目标，不把元数据一并放行。JSON 例外拒绝同名 `json.*` 查询参数和方法覆盖头；其他字段、Cookie、头和请求解析检查保留。
+- 二进制上传：仅已知文件上传/分片接口的 `application/octet-stream` 及快捷图标接口的 PNG/JPEG/WebP，调整 `920420` 与注入规则的 `REQUEST_BODY` 目标。查询参数继续检查；JSON、其他媒体类型、其他路径及其他站点不借用例外。`SecRequestBodyAccess` 保持 On；ModSecurity 3.0.17 在 Off 时会跳过 phase 2，不能用它实现“只跳过文件内容”。应用仍负责会话、CSRF、文件类型、目录权限和大小校验；WAF 不是病毒扫描器。
+- WordPress：仅 GET/HEAD 的标准分类/标签/作者路径、受限含连字符的文章路径移除 `932260` 的 `REQUEST_FILENAME` 目标。其他 RCE 规则、查询和正文继续检查；不接受 shell 分隔符或编码绕过作为路径语法。
+- Flarum：JSON/JSON:API 的指定发帖/编辑字段可包含代码示例，标题和其他字段继续扫描。应用鉴权、CSRF 和内容渲染安全仍由论坛负责；不将这类源码字段例外推广到所有 REST API。
+
+KPanel 站点解析上限为 8192，默认请求达到 2048 参数仍拒绝；仅 PUT 桌面 workspace 的 JSON 正文允许至 8192 的专用预算（达到上限拒绝，防止解析截断后遗漏尾部字段）。其他站点解析上限保持 2048。该余量覆盖桌面 512 位置、512 标签及 512 隐藏项等合法结构；不提高全局正文容量或攻击评分阈值。
+
+隔离验证使用实际 ARM64 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0，固定本地镜像，不连接生产应用数据、Agent 或 Docker socket：79 项 Linux 单测、146 项公共应用请求形状及缓存语义、22 项真实 KPanel 鉴权/保存读回及 147 项原有真实引擎集成通过。覆盖查询与元数据攻击反例、畸形/超深 JSON、多站点、2048/8192 参数边界及超限尾部字段、9 MiB 原始文件正文、multipart、WebSocket/SSE、CDN 信任、Off/Detect/On 和重载恢复。Windows 单测 75 通过、4 项平台跳过；Linux 须使用受信私有 `TMPDIR`，不能以全局 `/tmp` 作为管理配置根目录。
+
+失败尝试保留在隔离证据中：初版遇到 Java 原始 JSON 重复扫描、桌面参数不足、为不存在的数组项添加大量动态例外导致超时，均先复现后调整；新增例外仅对实际存在字段添加，规则列表按配置档共享编译。单 CPU ARM64 隔离样本的 32 帧输入约 246 ms，最大桌面元数据约 1 s、64 个代码快捷方式约 3.6 s、8191 个普通叶子约 6.4 s；这些是边界单次样本，不代表所有用户性能或长时间稳定性。512 MiB 旧式单体上传、所有扩展/第三方应用及真实用户终端执行未全部验证；实际应用测试只做到保存、鉴权和 Agent 边界。
+
+最终共享配置固定为 [993ab1d](https://github.com/kejilion/nginx/commit/993ab1d89c2b19abbb89205ddc936c5962ad6828)，根/CN 脚本入口为 [d9ee024](https://github.com/kejilion/sh/commit/d9ee024ceed6b3057edad4caa3bb526e186e9cd4)，版本仍为配置包 1.0.5 / 脚本 4.5.14，不重建镜像。授权 EU 试点保持 mixed 来源信任并开启 WAF；重载/doctor、10 项正常生产请求、真实 Docker/终端 WebP、应用会话拒绝及重复计划零漂移通过。原有镜像身份不变。公开六文件与两脚本字节校验一致，生产机器已通过发布脚本实际下载、校验和幂等应用；本机两份旧入口仅对齐 WAF 固定来源与摘要，其他内容保留，恢复点分别保留。真实账户的 Docker 操作与终端执行仍需按用户实际业务复验，生产 401 只证明到达应用鉴权，不代表执行成功。
+
+其他用户需更新脚本并通过现有 WAF 开关/共享刷新入口取得新配置；只拉取 WAF 镜像不会自动替换旧的宿主策略。已安装面板若固化旧脚本，仍需核对或更新其实际调用来源，不宣称所有旧发行包已自动升级。
+
+依据：[CRS 精确排除](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)、[CRS 4.30 路径检查变更](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)、[ModSecurity v3 指令及 ctl 限制](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-%28v3.x%29)、[3.0.17 正文处理实现](https://github.com/owasp-modsecurity/ModSecurity/blob/v3.0.17/src/transaction.cc)、[Flarum JSON:API](https://docs.flarum.org/extend/api/)。本轮仍沿用六文件固定配置包，直连/CDN 信任和现有 WAF 开关独立保留。
+
+## 2026-10-26 公共例外执行性能与上游升级
+
+本次候选针对 ModSecurity 3.0.17 在运行期目标排除中反复展开不相关静态标签的成本，不减少检测规则、不提高评分阈值、不扩大业务豁免。静态标签先比较字段目标，再判断标签；只要规则包含动态宏标签，就保留原有标签优先顺序及求值副作用。空排除表不额外遍历标签。依据为实际固定的[官方执行实现](https://github.com/owasp-modsecurity/ModSecurity/blob/1925753989ccce977cdaae417b55c9726c7cf02c/src/rule_with_operator.cc)及标签实现，而非将该局部补丁视为上游已发布修复。
+
+首份镜像源码为 docker 仓库 `de1303ae5396208ca2eacb16d43d828677056f31`，补丁仅验证 ModSecurity 3.0.17 和源码提交 `1925753989ccce977cdaae417b55c9726c7cf02c`，没有增加对象成员或虚函数。该初版曾把优化适用条件作为强制构建条件；用户要求平滑跟随上游后，已调整为下述可选优化机制，不再以此阻止新引擎构建。原型阶段在原生产镜像根文件系统上替换候选库，镜像 ID 为 `sha256:84345c8095256a13dadbdd4ca776d7ef9d42d76cdd5fd47a3c7cf96aeddefda7`，库 SHA256 为 `84e6952c162275e867abe0335f239bd6528acb8333b981b85eaf5dab9f436616`。私有原型的编译前缀与正式流程不同，不作为正式发布产物。
+
+公平比较使用相同 8511 字节脱敏 JSON，50 个位置、20 个快捷方式，正文 SHA256 为 `a97c9dfe276eee9f6618050c27b49b1307fece369e60de2243cf9802b877cef4`。各组限制 1 CPU / 768 MiB、无外网、同一轻量上游，profile/generic/Off 交错执行，每种模式 10 次，去掉前两次预热后取 8 次中位数。另用同一工具链和依赖重编原执行顺序作为对照，排除编译环境变化造成的主要收益。
+
+| 隔离样本处理耗时 P50 | 原生产镜像 | 同工具链原顺序对照 | 候选原型 |
+| --- | ---: | ---: | ---: |
+| KPanel profile | 1475.49 ms | 1471.12 ms | 98.67 ms |
+| generic | 113.42 ms | 113.55 ms | 93.97 ms |
+| WAF Off | 2.25 ms | 2.11 ms | 2.14 ms |
+
+该 profile 样本处理耗时下降约 93.3%，不包含公网、CDN、浏览器 debounce 或实际业务执行时间，也不是所有请求的提速或长期吞吐承诺。原始结果位于试验机私有目录 `/root/waf-perf-guard26/summary.json` 及各组 `results.json`；未公布原始桌面数据或凭据。尚未完成并发容量、长期 CPU/内存趋势及 amd64 性能比较，不能据此提高公共容量参数或减少既有余量。
+
+原型通过完整镜像门禁、36 项镜像兼容、16 项目标排除语义对照（含动态标签、大小写、整集合、错误标签及空标签配置拒绝，逐项比较状态、规则 ID 和评分），以及现行共享包的 146 项公共应用/缓存、147 项既有引擎集成和 22 项真实 KPanel 鉴权/保存读回检查。独立复核已完成。失败尝试保留：最初测试目录只读导致 Unix socket 无法建立，修正隔离夹具写权限后通过；空字面标签本来就被 3.0.17 拒绝，改为显式验证候选和基线均拒绝，未为测试放宽解析器。
+
+422 单独处理：KPanel 源码候选 `362e1feb17762aa3274d01cc14e0775659dc25c8` 仅补齐既有前端使用的 `/virtual-machines` 与 `/sites/monitor` 窗口路径校验，并验证相似前缀、额外路径和越界路径仍拒绝。Linux 官方变更门禁、store 竞态测试及独立安全盲审通过。生产失败请求的原始正文未记录，因此该缺口已确认，但不能断言历史每一次 422 均由它引起；不通过放宽 WAF 来处理应用校验错误。
+
+422 按用户选择只合入源码，留待下一次 KPanel 发行，不覆盖已经发布的 rc.7 或部署新面板程序。功能提交 `362e1feb` 后补充现有扫描范围的源文件身份，集成提交为 `af2c6fbcce34d3ffe2c1b19b14a89ec656f7f051`；候选和主线 Linux CI 均通过。首次候选 CI 因第一方源码身份未重新绑定失败，修正身份后重跑，没有增加例外、变更现有扫描结论或延长到期日。已保留原任务分支精确 tip 到 `archive/fix/preferences-route-validation-20261026`。
+
+镜像平滑升级候选 `aa9f40e` 取消强制版本锁：未知上游版本、不同源码或补丁预检不适用时，自动保留官方源码继续构建；只有精确满足已验证条件且实际打补丁成功才记录 `optimized`，其他情况记录 `upstream`。记录随镜像位于 `/usr/share/doc/kejilion-waf/modsecurity-optimization.json`，并由正式镜像读出写入构建产物 `components.json` 与 Actions 摘要。六项已验证/次版本/主版本/源码改变/补丁不适用/非法版本检查及独立复核通过；正式双架构构建与同批产物发布另按实际结果登记。退回上游可能失去本轮加速，不改变正常保护逻辑；真正的编译或业务兼容失败仍会中止发布，不能保证任何未知未来版本无条件通过。
+
+未采用的纯规则替代也保留证据：将标签排除展开为当前 CRS 规则编号后，同一桌面样本约 409 ms，但配置从约 0.5 MiB 增至约 9 MiB，64 个代码快捷方式仍约 850 ms，因此未进入公共默认。此试验只在固定源码与隔离夹具上执行，不能宣称该转换已实现可通用维护的解析器。
+
+共享包继续加载镜像内的官方 CRS 规则；显式正文解析、参数预算、审计和精确排除会覆盖相应默认，官方新增配置不会因此自动启用。日常规则调整不需重编镜像；引擎与 CRS 的升级仍按现有兼容门禁验证，但可选性能优化不成为其必需依赖。共享六文件 `993ab1d`、原生脚本 `d9ee024`、CDN 信任及原开关在本轮均保持原样。
+
+最终源码为 [`aa9f40e`](https://github.com/kejilion/docker/commit/aa9f40e818629122fccce33ee722620fc2a8b427)，[正式构建 40284738493](https://github.com/kejilion/docker/actions/runs/40284738493) 完成 amd64 / arm64 原生编译，各通过 36 项兼容、16 项目标语义检查和 6 项可选优化回退检查。ARM 正式产物另通过 146 项公共应用/缓存、147 项原有引擎集成、22 项真实 KPanel 及与原镜像的 16 项语义对照。独立复核未发现可信阻断问题；未知未来引擎未实际编译，次/主版本用例验证的是准入回退流程，不冒充未来版本兼容实测。
+
+新正式产物在同一 8511 字节脱敏请求上完成 39 项有界比较，去掉每组两次预热后的 8 次中位数为：原镜像 profile 1538.27 ms、新产物 96.57 ms；generic 119.20→91.70 ms，Off 1.88→1.90 ms。64 个代码快捷方式的三次样本中位数为 3735.63→90.53 ms；最大桌面结构约 1057→878 ms，8191 个普通参数约 6462→5601 ms，后者仍是明显成本，不能宣传已消除所有大 JSON 开销。新结果位于试验机私有 `/root/waf-engine-upstream-20261026/performance/`；所有请求只到隔离轻量上游，未在生产发攻击样本或执行用户命令，不把处理耗时当作网络或 UI 端到端收益。
+
+EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求及复查各 10 项无差异，实际 Docker WebP 内容一致，受保护接口仍由应用拒绝未登录访问；KPanel 容器、宿主策略、CF/mixed 信任及持久 Compose 保持原样。改进后镜像实际记录 `optimized / verified-source`。生产观察是本轮短窗口事实，未做长期内存或并发容量承诺。恢复顺序及原始证据分别保留在 `/root/waf-engine-upstream-20261026/previous-compose.json`（退回首份性能镜像）和 `/root/waf-engine-formal-20261026/previous-compose.json`（再退回本轮前镜像）；涉及宿主配置恢复时仍遵循更早共享包备份顺序。
+
+[同批产物发布 40285955080](https://github.com/kejilion/docker/actions/runs/40285955080) 已完成，未重建验证后的镜像。公开 `kjlion/nginx:alpine` / `1.31.8-alpine` 同指向 `sha256:065a40f37e508787769513aca655fc541acf687afffd57b25241b1a6bac53ef8`；amd64 配置 ID 为 `sha256:2a2a84d16b8f7ed8604e378dc6a39b0b716d3a7a9723b7648f66333d888a22b4`，arm64 为 `sha256:1a31e330f71409f19042cdbc78b5bc9d423d9eab47a33b8dbc15586b156bb323`。两个架构的公开配置和 RootFS 逐项匹配各自 CI 产物；EU 实际拉取不可变公开 digest 后与试点镜像一致。首份强制源码条件产物 `sha256:c64fd9585362f51a38d5716bc961b183d3a10789e4b8849b03e6427ffc8fefb3` 已由本版公共标签替代，不再作为后续升级方案。
+
+本轮不改版本号。现有用户通过原 Nginx 镜像更新入口取得本版即可，无须调整 CF 模式、重开 WAF 或手工维护补丁；仅更新镜像仍不会替换旧宿主规则包，也不会自动安装 KPanel 的 422 修复。镜像目录中的状态文件和正式构建报告用于核对当前是否启用可选加速，不能以版本号相同推断已取得同一产物。

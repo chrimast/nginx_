@@ -16,6 +16,56 @@ import policy
 
 
 class ManagedTrustTests(unittest.TestCase):
+    def test_cache_predicates_preserve_http_server_and_location_inheritance(self):
+        def check(server):
+            return nginx_edit.cache_inheritance('# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_nocache; proxy_no_cache $http_x_private; '+server+' }')['panel.example']
+        self.assertEqual(check('server { server_name panel.example; }'),{'proxy_cache_bypass':['$arg_nocache'],'proxy_no_cache':['$http_x_private']})
+        self.assertEqual(check('server { server_name panel.example; proxy_cache_bypass $http_x_custom; }'),{'proxy_cache_bypass':[],'proxy_no_cache':['$http_x_private']})
+        self.assertEqual(check('server { server_name panel.example; location / { proxy_cache_bypass $http_x_location; proxy_no_cache $http_x_location; } }'),{'proxy_cache_bypass':['$arg_nocache'],'proxy_no_cache':['$http_x_private']})
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_nocache; proxy_no_cache $http_x_private; server { server_name panel.example; include /etc/nginx/conf.d/waf/server-default.inc; } }\n# configuration file /etc/nginx/conf.d/waf/server-default.inc:\nproxy_cache_bypass $http_cookie; proxy_no_cache $http_cookie;\n'
+        self.assertEqual(nginx_edit.cache_inheritance(dump)['panel.example'],check('server { server_name panel.example; }'))
+        self.assertEqual(nginx_edit.cache_inheritance(dump.replace('panel.example','Panel.Example'))['panel.example'],check('server { server_name panel.example; }'))
+        self.assertEqual(check('server { server_name panel.example; }'),nginx_edit.cache_inheritance(dump.replace('proxy_cache_bypass','"proxy_cache_bypass"'))['panel.example'])
+        ambiguous='# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_http; server { server_name panel.example; proxy_cache_bypass $arg_server; } server { server_name panel.example; } }'
+        self.assertIsNone(nginx_edit.cache_inheritance(ambiguous)['panel.example'])
+        config=json.loads((manage.BUNDLE/'example-policy.json').read_text());config['sites']={'panel.example':{'profile':'kpanel'}}
+        with self.assertRaisesRegex(ValueError,'Conflicting cache inheritance'):
+            policy.bundle_files(config,[],cache_controls=nginx_edit.cache_inheritance(ambiguous))
+        config['sites']['panel.example']['profile']='generic'
+        policy.bundle_files(config,[],cache_controls=nginx_edit.cache_inheritance(ambiguous))
+
+    def test_flarum_metadata_and_mixed_application_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);(root/'public').mkdir();(root/'vendor/flarum/core').mkdir(parents=True)
+            (root/'composer.json').write_text(json.dumps({'require':{'flarum/core':'^2'}}))
+            vendor=root/'vendor/flarum/core/composer.json';vendor.write_text(json.dumps({'name':'flarum/core'}))
+            self.assertTrue(manage.app_is_flarum(root/'public'))
+            for invalid in [[],42,None,{'require':[]}]:
+                (root/'composer.json').write_text(json.dumps(invalid))
+                self.assertFalse(manage.app_is_flarum(root/'public'))
+        def scope(body):return manage.flarum_scope_is_unmixed(nginx_edit.statement_scopes(nginx_edit.tokens(body)))
+        self.assertTrue(scope('root /var/www/html/forum/public; location ~ \\.php$ { include fastcgi_params; fastcgi_pass php:9000; }'))
+        for body in ['location /api/posts { proxy_pass http://other; }','include /etc/nginx/business.inc;',
+                     'location /other { root /var/www/html/other; }','location /other { alias /var/www/html/other; }',
+                     'location /api/posts { fastcgi_param SCRIPT_FILENAME /var/www/html/other/index.php; fastcgi_pass php:9000; }']:
+            self.assertFalse(scope(body))
+        for quote in ['"',"'"]:
+            self.assertFalse(scope('location /api/posts { fastcgi_param '+quote+'SCRIPT_FILENAME'+quote+' /var/www/html/other/index.php; fastcgi_pass php:9000; }'))
+            self.assertFalse(scope(quote+'proxy_pass'+quote+' http://other;'))
+
+    def test_native_mixed_case_proxy_upstream_identifies_only_one_application(self):
+        text='upstream backend_IycLeFBR { server 127.0.0.1:8080; } server { server_name panel.example; location / { proxy_pass http://backend_IycLeFBR; } }'
+        block=nginx_edit.server_blocks(text)[0]
+        endpoints={('127.0.0.1','8080')}
+        self.assertTrue(manage.app_is_kpanel(text,block,endpoints))
+        for candidate in [text.replace('8080','9090'),
+                          text.replace('server 127.0.0.1:8080;', 'server 127.0.0.1:8080; server 127.0.0.1:9090;'),
+                          text.replace('location / {', 'location /php { include /etc/nginx/php.inc; } location / {'),
+                          text.replace('location / {', 'location /other { "proxy_pass" "http://127.0.0.1:9090"; } location / {'),
+                          text.replace('location / {', 'location /php { fastcgi_pass unix:/php.sock; } location / {')]:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(manage.app_is_kpanel(candidate,nginx_edit.server_blocks(candidate)[0],endpoints))
+
     def test_method_gateway_capabilities_follow_scopes_includes_and_derived_variables(self):
         def check(http,site,expected):
             dump='# configuration file /etc/nginx/nginx.conf:\nhttp { '+http+' include /etc/nginx/site.conf; }\n# configuration file /etc/nginx/site.conf:\n'+site+'\n'

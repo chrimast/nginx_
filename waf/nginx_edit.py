@@ -120,7 +120,7 @@ def patch_site(text: str, config: dict) -> str:
         if name == '_' and re.search(r'\breturn\s+444\s*;', body):
             continue
         filename = 'server-default*.inc'
-        if 'cdn' in config.get('sites', {}).get(name, {}):
+        if 'cdn' in config.get('sites', {}).get(name, {}) or config.get('sites', {}).get(name, {}).get('profile')=='kpanel':
             filename = 'server-' + hashlib.sha256(name.encode()).hexdigest()[:16] + '.inc'
         suffix='' if text[block['open']:].startswith('\n') else '\n'
         insertions.append((block['open'], '\n    include /etc/nginx/conf.d/waf/' + filename + ';'+suffix))
@@ -257,6 +257,30 @@ def configuration_scopes(dump):
     return statement_scopes(expand(main))
 
 
+def cache_inheritance(dump):
+    """Preserve HTTP cache predicates when a managed server adds its own list."""
+    groups=configuration_scopes(dump);result={}
+    directives=['proxy_cache_bypass','proxy_no_cache']
+    for ident,group in groups.items():
+        if group['kind'].strip('\"\'')!='server':continue
+        names=[t.value.strip('\"\'').lower() for s in group['statements'] if s[0].value.strip('\"\'')=='server_name' for t in s[1:-1]]
+        controls={}
+        for directive in directives:
+            current=ident
+            while current is not None:
+                statements=[s for s in groups[current]['statements'] if s[0].value.strip('\"\'')==directive and not re.fullmatch(r'/etc/nginx/conf[.]d/waf/server-(?:default|[a-f0-9]{16})[.]inc',s[0].source)]
+                if statements:
+                    # Existing server predicates are already in that scope;
+                    # only inherited parent lists need copying into the hook.
+                    controls[directive]=[] if current==ident else [t.value for s in statements for t in s[1:-1]]
+                    break
+                current=groups[current]['parent']
+            else:controls[directive]=[]
+        for name in names:
+            result[name]=None if name in result and result[name]!=controls else controls
+    return result
+
+
 def method_override_controls(dump):
     """Keep method-dependent gateway authorization stricter than compatibility.
 
@@ -301,7 +325,7 @@ def method_override_controls(dump):
             if key in {'proxy_set_header','fastcgi_param','uwsgi_param','scgi_param'} and len(statement)>2:
                 target=statement[1].value.strip('\"\'').lower().replace('_','-')
                 if target.removeprefix('http-') in {'x-http-method-override','x-http-method','x-method-override'}:sensitive=True
-            if key=='modsecurity_rules':sensitive=True
+            if key=='modsecurity_rules' and statement[1].value.strip('\"\'')!='SecArgumentsLimit 8192':sensitive=True
             if key=='modsecurity_rules_file' and statement[1].value.strip('\"\'') not in {'/etc/nginx/modsec/modsecurity.conf','/etc/nginx/conf.d/waf/modsecurity.conf'}:sensitive=True
             dependent=variable(' '.join(t.value for t in statement[1:-1])) & variables
             standard_method=(key in {'fastcgi_param','uwsgi_param','scgi_param'} and
