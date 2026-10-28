@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-VERSION = "1.0.5"
+VERSION = "1.1.0"
 MAX_SITES = 200
 MAX_BANS = 10000
 MAX_STATE_BYTES = 4 * 1024 * 1024
@@ -45,13 +45,18 @@ def networks(data: dict) -> list[str]:
 
 def validate(config: dict) -> dict:
     allowed = {"schemaVersion", "mode", "cdn", "container", "sites", "trustedProxies", "proxyHeader",
-               "rate", "burst", "connections", "attackRetries", "rateRetries", "banSeconds", "logTimezone", "banBackend", "methodOverride"}
+               "rate", "burst", "connections", "attackRetries", "rateRetries", "banSeconds", "banIgnore", "logTimezone", "banBackend", "methodOverride"}
     if set(config) - allowed:
         raise ValueError("Unknown policy fields: " + ", ".join(sorted(set(config) - allowed)))
     if config.get("schemaVersion") != 1:
         raise ValueError("Unsupported WAF policy schema")
     if config.get('banBackend','existing') not in {'none','existing'}:
         raise ValueError('Unsupported existing ban integration')
+    ignored=config.get('banIgnore',[])
+    if not isinstance(ignored,list) or len(ignored)>128:
+        raise ValueError('Invalid ban protection list')
+    for entry in ignored:
+        ipaddress.ip_network(entry,strict=False)
     if config.get('methodOverride','guarded') not in {'guarded','strict'}:
         raise ValueError('Invalid method override policy')
     if not re.fullmatch(r'UTC(?:[+-](?:0[0-9]|1[0-4])[0-5][0-9])?', config.get('logTimezone','UTC')):
@@ -406,6 +411,21 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
     lines+=content_lines
     for name,site in sorted(config['sites'].items()):
         if site.get('profile')=='artifact-proxy':
+            # Download identifiers may contain command names (e.g. docker-).
+            # Only literal, bounded segments are eligible; encoded paths and
+            # shell syntax retain the original filename inspection.
+            artifact_segment = r'(?![.])[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}'
+            artifact_path = (r'^/(?:' +
+                r'(?:https?://)?raw[.]githubusercontent[.]com/' +
+                artifact_segment + r'(?:/' + artifact_segment + r'){1,15}' +
+                r'|v2/' + artifact_segment + r'(?:/' + artifact_segment + r'){0,5}/manifests/(?:' + artifact_segment + r'|sha256:[a-f0-9]{64}))$')
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                      '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
+                      '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx ^(?!.*[.][.])" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx '+artifact_path+'" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"']
+            rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
@@ -421,6 +441,15 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
                       '    SecRule REQUEST_METHOD "@streq POST" "t:none,chain"',
                       '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
                       '    SecRule REQUEST_HEADERS:Content-Type "@streq application/x-git-upload-pack-request" "t:none,t:lowercase,ctl:ruleRemoveById=920420"']
+            rid+=1
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                      '    SecRule REQUEST_METHOD "@streq POST" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:content-type)$/ "@eq 1" "t:none,chain"',
+                      '    SecRule REQUEST_HEADERS:Content-Type "@streq application/x-git-upload-pack-request" "t:none,t:lowercase,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:content-encoding)$/ "@eq 1" "t:none,chain"',
+                      '    SecRule REQUEST_HEADERS:Content-Encoding "@streq gzip" "t:none,t:lowercase,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:Content-Encoding,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:content-encoding,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:CONTENT-ENCODING"']
             rid+=1
     return "\n".join(lines + exceptions) + "\n"
 
@@ -547,6 +576,7 @@ def render_filters() -> dict[str, str]:
     # F-ID is intentionally site|IP, so Fail2Ban counters do not cross vhosts.
     identity = r"[A-Za-z0-9_.*-]+\|[0-9a-fA-F:.]+"
     rate = ('[Definition]\n'
+            'datepattern = ^%%Y-%%m-%%dT%%H:%%M:%%S%%z\n'
             'failregex = ^\\s*key="<F-ID>' + identity + '</F-ID>" event=rate '
             'request_limit="(?:REJECTED|[A-Z_]*)" connection_limit="(?:REJECTED|[A-Z_]*)"$\n'
             'ignoreregex = request_limit="(?:PASSED|DELAYED|REJECTED_DRY_RUN|DELAYED_DRY_RUN)?" connection_limit="(?:PASSED|REJECTED_DRY_RUN)?"$\n')
@@ -562,5 +592,5 @@ def render_filters() -> dict[str, str]:
                 r'"response": \{"http_code": 403\}, "producer": \{.*?\}, "messages": \[.*'
                 r'(?<!\\)"ruleId": "(?:949110|949111|1110|1111)".*\}\s*$')
     structured=structured.replace(': ',r':\s*').replace(', ',r',\s*')
-    attack='[Definition]\nfailregex = '+structured+'\nignoreregex =\n'
+    attack='[Definition]\ndatepattern = %%a %%b %%d %%H:%%M:%%S %%Y\nfailregex = '+structured+'\nignoreregex =\n'
     return {"waf-rate.conf": rate, "waf-attack.conf": attack}
